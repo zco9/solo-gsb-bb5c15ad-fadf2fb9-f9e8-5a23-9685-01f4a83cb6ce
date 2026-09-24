@@ -120,6 +120,78 @@ class TestCompareReports:
         assert result["counts"]["persisting"] == 1
         assert result["counts"]["fixed"] == 1
 
+    def test_interleaved_severities_pair_as_persisting(self):
+        # 同一指纹：基线 error, warning；当前 warning, error（顺序交错）。
+        # 严重级别多重集相同，必须全部配为 persisting，不能按出现顺序
+        # 误报两条 severity_changed（即使错误 / 警告总数均未变化）。
+        same = dict(path="#/properties/x", code="required_added", reason="r")
+        baseline = make_report([
+            make_issue(severity="error", **same),
+            make_issue(severity="warning", **same),
+        ])
+        current = make_report([
+            make_issue(severity="warning", **same),
+            make_issue(severity="error", **same),
+        ])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 0, "fixed": 0, "persisting": 2,
+                                    "severity_changed": 0}
+        assert result["issues"]["severity_changed"] == []
+        assert {i["severity"] for i in result["issues"]["persisting"]} == {
+            "error", "warning"}
+        # 总数不变 -> errors / warnings / total 的 delta 均为 0
+        assert result["summary_diff"]["errors"]["delta"] == 0
+        assert result["summary_diff"]["warnings"]["delta"] == 0
+        assert result["summary_diff"]["total"]["delta"] == 0
+
+    def test_interleaved_severities_with_real_change_and_extra(self):
+        # 同一指纹的交错多重集，且夹带真实变化与数量差：
+        # 基线 error×2, warning；当前 error, warning×2（先配同级别：
+        # 1 error + 1 warning persisting，剩余 1 error↔1 warning 变化），
+        # 当前还多出 1 warning -> added。
+        same = dict(path="#/properties/y", code="type_removed", reason="r")
+        baseline = make_report([
+            make_issue(severity="error", **same),
+            make_issue(severity="error", **same),
+            make_issue(severity="warning", **same),
+        ])
+        current = make_report([
+            make_issue(severity="warning", **same),
+            make_issue(severity="error", **same),
+            make_issue(severity="warning", **same),
+            make_issue(severity="warning", **same),
+        ])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 1, "fixed": 0, "persisting": 2,
+                                    "severity_changed": 1}
+        changed = result["issues"]["severity_changed"]
+        assert len(changed) == 1
+        assert changed[0]["baseline_severity"] == "error"
+        assert changed[0]["current_severity"] == "warning"
+        assert result["issues"]["added"][0]["severity"] == "warning"
+        assert result["summary_diff"]["errors"]["delta"] == -1
+        assert result["summary_diff"]["warnings"]["delta"] == 2
+
+    def test_interleaved_severities_extra_baseline_is_fixed(self):
+        # 基线 error, warning；当前仅 warning：同级别 warning persisting，
+        # 基线多出的 error 归 fixed（不应算作 severity_changed）。
+        same = dict(path="#/properties/z", reason="r")
+        baseline = make_report([
+            make_issue(severity="error", **same),
+            make_issue(severity="warning", **same),
+        ])
+        current = make_report([make_issue(severity="warning", **same)])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 0, "fixed": 1, "persisting": 1,
+                                    "severity_changed": 0}
+        assert result["issues"]["fixed"][0]["severity"] == "error"
+
     def test_identical_reports_all_persisting(self):
         report = make_report([make_issue(), make_issue(code="enum_value_removed")])
         result = compare.compare_reports(report, report)

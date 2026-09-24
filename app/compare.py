@@ -14,19 +14,25 @@
   十六进制字符。指纹不包含 severity，因此同一问题仅严重级别变化时
   指纹保持不变，可被识别为"仅严重级别变化"。
 
-分类规则（同一指纹按出现次数做多重集配对）：
+分类规则（同一指纹内按严重级别做多重集配对）：
 
 * ``added``：仅出现在当前报告 —— 新增问题；
 * ``fixed``：仅出现在基线报告 —— 已修复问题；
 * ``persisting``：两份报告都存在且严重级别相同 —— 仍存在；
 * ``severity_changed``：两份报告都存在但严重级别不同 —— 仅严重级别变化。
 
+同一指纹的配对分两阶段进行：**先**把严重级别相同的记录两两配为
+``persisting``（如基线 ``error, warning`` 与当前 ``warning, error`` 应得到
+两条 ``persisting``，而非按出现顺序误配成两条 ``severity_changed``）；
+**再**把双方剩余记录跨严重级别配为 ``severity_changed``；最后基线多出的
+归入 ``fixed``、当前多出的归入 ``added``。
+
 对比过程只读取两份报告，绝不修改原始分析记录。
 """
 from __future__ import annotations
 
 import hashlib
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any
 
 from app.compat import HEURISTIC_SUFFIX
@@ -120,34 +126,64 @@ def _compatibility_diff(baseline_report: dict, current_report: dict) -> dict:
 
 def compare_reports(baseline_report: dict, current_report: dict) -> dict:
     """对比两份分析报告，返回问题分类与汇总差异（纯函数，不修改入参）。"""
-    # 基线指纹 -> 待配对 issue 队列（同一指纹可能出现多次，按多重集配对）
-    unmatched: dict[str, deque] = {}
+    # 每个指纹按严重级别分桶（保留报告中的出现顺序，桶内按多重集配对）
+    baseline_groups: dict[str, dict[Any, deque]] = defaultdict(
+        lambda: defaultdict(deque))
+    current_groups: dict[str, dict[Any, deque]] = defaultdict(
+        lambda: defaultdict(deque))
     for issue in baseline_report.get("issues", []):
-        unmatched.setdefault(issue_fingerprint(issue), deque()).append(issue)
+        baseline_groups[issue_fingerprint(issue)][issue.get("severity")].append(issue)
+    for issue in current_report.get("issues", []):
+        current_groups[issue_fingerprint(issue)][issue.get("severity")].append(issue)
 
     added: list[dict] = []
     fixed: list[dict] = []
     persisting: list[dict] = []
     severity_changed: list[dict] = []
 
-    for issue in current_report.get("issues", []):
-        fingerprint = issue_fingerprint(issue)
-        queue = unmatched.get(fingerprint)
-        if not queue:
-            added.append(_issue_entry(issue))
-            continue
-        baseline_issue = queue.popleft()
-        if baseline_issue.get("severity") == issue.get("severity"):
-            persisting.append(_issue_entry(issue))
-        else:
-            entry = _issue_entry(issue)
-            entry["baseline_severity"] = baseline_issue.get("severity")
-            entry["current_severity"] = issue.get("severity")
-            severity_changed.append(entry)
+    # 指纹与严重级别均排序遍历，保证配对选择与输出顺序稳定
+    for fingerprint in sorted(set(baseline_groups) | set(current_groups)):
+        baseline_by_sev = baseline_groups.get(fingerprint, {})
+        current_by_sev = current_groups.get(fingerprint, {})
+        severities = sorted(set(baseline_by_sev) | set(current_by_sev),
+                            key=lambda sev: str(sev))
 
-    for queue in unmatched.values():
-        for issue in queue:
-            fixed.append(_issue_entry(issue))
+        # 阶段一：相同严重级别优先配为 persisting
+        for severity in severities:
+            same_base = baseline_by_sev.get(severity)
+            same_current = current_by_sev.get(severity)
+            if not same_base or not same_current:
+                continue
+            while same_base and same_current:
+                same_base.popleft()
+                persisting.append(_issue_entry(same_current.popleft()))
+
+        # 阶段二：双方剩余记录严重级别集合必然不相交（相同级别的桶至少
+        # 有一方已在阶段一清空），跨严重级别逐条配为 severity_changed
+        leftover_base = [baseline_by_sev[sev] for sev in severities
+                         if baseline_by_sev.get(sev)]
+        leftover_current = [current_by_sev[sev] for sev in severities
+                            if current_by_sev.get(sev)]
+        bi = ci = 0
+        while bi < len(leftover_base) and ci < len(leftover_current):
+            base_bucket = leftover_base[bi]
+            cur_bucket = leftover_current[ci]
+            baseline_issue = base_bucket.popleft()
+            current_issue = cur_bucket.popleft()
+            entry = _issue_entry(current_issue)
+            entry["baseline_severity"] = baseline_issue.get("severity")
+            entry["current_severity"] = current_issue.get("severity")
+            severity_changed.append(entry)
+            if not base_bucket:
+                bi += 1
+            if not cur_bucket:
+                ci += 1
+
+        # 基线多出的为 fixed，当前多出的为 added
+        fixed.extend(_issue_entry(issue)
+                     for bucket in leftover_base for issue in bucket)
+        added.extend(_issue_entry(issue)
+                     for bucket in leftover_current for issue in bucket)
 
     added.sort(key=_sort_key)
     fixed.sort(key=_sort_key)
