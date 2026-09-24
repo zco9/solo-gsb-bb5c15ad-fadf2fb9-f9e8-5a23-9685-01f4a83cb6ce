@@ -14,19 +14,24 @@
   十六进制字符。指纹不包含 severity，因此同一问题仅严重级别变化时
   指纹保持不变，可被识别为"仅严重级别变化"。
 
-分类规则（同一指纹按出现次数做多重集配对）：
+分类规则（同一指纹按出现次数做多重集配对，配对有优先级）：
 
-* ``added``：仅出现在当前报告 —— 新增问题；
-* ``fixed``：仅出现在基线报告 —— 已修复问题；
-* ``persisting``：两份报告都存在且严重级别相同 —— 仍存在；
-* ``severity_changed``：两份报告都存在但严重级别不同 —— 仅严重级别变化。
+1. 同一指纹内**先按相同 severity 配对**为 ``persisting``（仍存在）；
+2. 两侧剩余记录的 severity 必然互不相同，再两两配为
+   ``severity_changed``（仅严重级别变化）；
+3. 配对后数量多出的记录：仅基线有归入 ``fixed``（已修复），
+   仅当前有归入 ``added``（新增）。
+
+如此即使基线为 [error, warning]、当前为 [warning, error] 这类交错顺序，
+也会先在各自 severity 内配成两条 persisting，而不会因逐条按出现顺序
+配对而误报两次 severity_changed。
 
 对比过程只读取两份报告，绝不修改原始分析记录。
 """
 from __future__ import annotations
 
 import hashlib
-from collections import deque
+from collections import defaultdict, deque
 from typing import Any
 
 from app.compat import HEURISTIC_SUFFIX
@@ -120,34 +125,62 @@ def _compatibility_diff(baseline_report: dict, current_report: dict) -> dict:
 
 def compare_reports(baseline_report: dict, current_report: dict) -> dict:
     """对比两份分析报告，返回问题分类与汇总差异（纯函数，不修改入参）。"""
-    # 基线指纹 -> 待配对 issue 队列（同一指纹可能出现多次，按多重集配对）
-    unmatched: dict[str, deque] = {}
+    # 先按指纹分组（dict 保留首次出现顺序，使输出稳定），
+    # 组内保留 issue 在各报告中的出现顺序
+    baseline_groups: dict[str, list[dict]] = defaultdict(list)
+    current_groups: dict[str, list[dict]] = defaultdict(list)
     for issue in baseline_report.get("issues", []):
-        unmatched.setdefault(issue_fingerprint(issue), deque()).append(issue)
+        baseline_groups[issue_fingerprint(issue)].append(issue)
+    for issue in current_report.get("issues", []):
+        current_groups[issue_fingerprint(issue)].append(issue)
 
     added: list[dict] = []
     fixed: list[dict] = []
     persisting: list[dict] = []
     severity_changed: list[dict] = []
 
-    for issue in current_report.get("issues", []):
-        fingerprint = issue_fingerprint(issue)
-        queue = unmatched.get(fingerprint)
-        if not queue:
-            added.append(_issue_entry(issue))
-            continue
-        baseline_issue = queue.popleft()
-        if baseline_issue.get("severity") == issue.get("severity"):
-            persisting.append(_issue_entry(issue))
-        else:
-            entry = _issue_entry(issue)
+    for fingerprint in {**baseline_groups, **current_groups}:
+        baseline_issues = baseline_groups.get(fingerprint, [])
+        current_issues = current_groups.get(fingerprint, [])
+
+        # 第一步：按相同 severity 配对为 persisting（组内保留出现顺序）
+        base_left: dict[Any, deque] = defaultdict(deque)
+        cur_left: dict[Any, deque] = defaultdict(deque)
+        severities = []
+        for issue in baseline_issues:
+            severity = issue.get("severity")
+            if severity not in base_left and severity not in cur_left:
+                severities.append(severity)
+            base_left[severity].append(issue)
+        for issue in current_issues:
+            severity = issue.get("severity")
+            if severity not in base_left and severity not in cur_left:
+                severities.append(severity)
+            cur_left[severity].append(issue)
+
+        for severity in severities:
+            same = min(len(base_left[severity]), len(cur_left[severity]))
+            for _ in range(same):
+                base_left[severity].popleft()
+                persisting.append(_issue_entry(cur_left[severity].popleft()))
+
+        # 第二步：两侧剩余记录 severity 必然互不相同，按 severity 出现
+        # 顺序两两配为 severity_changed
+        base_remaining = [i for severity in severities for i in base_left[severity]]
+        cur_remaining = [i for severity in severities for i in cur_left[severity]]
+        changed = min(len(base_remaining), len(cur_remaining))
+        for baseline_issue, current_issue in zip(base_remaining[:changed],
+                                                 cur_remaining[:changed]):
+            entry = _issue_entry(current_issue)
             entry["baseline_severity"] = baseline_issue.get("severity")
-            entry["current_severity"] = issue.get("severity")
+            entry["current_severity"] = current_issue.get("severity")
             severity_changed.append(entry)
 
-    for queue in unmatched.values():
-        for issue in queue:
+        # 第三步：配对后多出的记录归入 fixed / added
+        for issue in base_remaining[changed:]:
             fixed.append(_issue_entry(issue))
+        for issue in cur_remaining[changed:]:
+            added.append(_issue_entry(issue))
 
     added.sort(key=_sort_key)
     fixed.sort(key=_sort_key)

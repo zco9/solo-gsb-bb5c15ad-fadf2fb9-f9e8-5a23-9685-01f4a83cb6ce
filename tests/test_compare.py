@@ -120,6 +120,87 @@ class TestCompareReports:
         assert result["counts"]["persisting"] == 1
         assert result["counts"]["fixed"] == 1
 
+    def test_interleaved_severities_pair_as_persisting(self):
+        # 同一指纹：基线为 error、warning，当前为 warning、error（顺序交错）。
+        # 严重级别构成不变，应先在相同 severity 内配成 persisting，
+        # 而不是按出现顺序逐条配对而误报两次 severity_changed。
+        baseline = make_report([
+            make_issue(severity="error"),
+            make_issue(severity="warning"),
+        ])
+        current = make_report([
+            make_issue(severity="warning"),
+            make_issue(severity="error"),
+        ])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 0, "fixed": 0, "persisting": 2,
+                                    "severity_changed": 0}
+        persisting_severities = sorted(
+            i["severity"] for i in result["issues"]["persisting"])
+        assert persisting_severities == ["error", "warning"]
+
+    def test_same_severity_paired_first_with_surplus(self):
+        # 同指纹交错且数量不等：基线 [error, error, warning]、
+        # 当前 [warning, warning, error]。
+        # 先配相同 severity：error 1 条、warning 1 条 persisting；
+        # 剩余 1 条基线 error 与 1 条当前 warning 配成 severity_changed。
+        baseline = make_report([
+            make_issue(severity="error"),
+            make_issue(severity="error"),
+            make_issue(severity="warning"),
+        ])
+        current = make_report([
+            make_issue(severity="warning"),
+            make_issue(severity="warning"),
+            make_issue(severity="error"),
+        ])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 0, "fixed": 0, "persisting": 2,
+                                    "severity_changed": 1}
+        persisting_severities = sorted(
+            i["severity"] for i in result["issues"]["persisting"])
+        assert persisting_severities == ["error", "warning"]
+        changed = result["issues"]["severity_changed"][0]
+        assert changed["baseline_severity"] == "error"
+        assert changed["current_severity"] == "warning"
+        assert changed["fingerprint"] == compare.issue_fingerprint(make_issue())
+
+    def test_interleaved_severities_with_extra_baseline(self):
+        # 基线多出的记录即使夹在交错顺序中也归入 fixed
+        baseline = make_report([
+            make_issue(severity="error"),
+            make_issue(severity="error"),
+            make_issue(severity="warning"),
+        ])
+        current = make_report([make_issue(severity="error")])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 0, "fixed": 2, "persisting": 1,
+                                    "severity_changed": 0}
+        assert sorted(i["severity"] for i in result["issues"]["fixed"]) == [
+            "error", "warning"]
+
+    def test_interleaved_severities_with_extra_current(self):
+        # 当前多出的记录归入 added，不与相反 severity 的基线记录错配
+        baseline = make_report([make_issue(severity="error")])
+        current = make_report([
+            make_issue(severity="error"),
+            make_issue(severity="warning"),
+            make_issue(severity="warning"),
+        ])
+
+        result = compare.compare_reports(baseline, current)
+
+        assert result["counts"] == {"added": 2, "fixed": 0, "persisting": 1,
+                                    "severity_changed": 0}
+        assert [i["severity"] for i in result["issues"]["added"]] == [
+            "warning", "warning"]
+
     def test_identical_reports_all_persisting(self):
         report = make_report([make_issue(), make_issue(code="enum_value_removed")])
         result = compare.compare_reports(report, report)
